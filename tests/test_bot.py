@@ -3,7 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from bot import AnonymousBot, BUTTON_TEXT, OWNER_DISABLED
+from bot import (
+    AnonymousBot,
+    BUTTON_TEXT,
+    HELP_BUTTON,
+    MAIN_MENU_MARKUP,
+    OWNER_DISABLED,
+    START_BUTTON,
+)
 from soroush_api import SoroushAPIError
 from storage import Storage
 
@@ -33,11 +40,11 @@ class FakeAPI:
         return {"message_id": self.next_id}
 
 
-def private_message(user_id, message_id, text=None, *, chat_id=None, reply_to=None, **content):
+def private_message(user_id, message_id, text=None, *, chat_id=None, reply_to=None, username="sample", **content):
     chat_id = chat_id if chat_id is not None else user_id
     message = {
         "message_id": message_id,
-        "from": {"id": user_id, "first_name": "آزمایشی", "last_name": "کاربر", "username": "sample"},
+        "from": {"id": user_id, "first_name": "آزمایشی", "last_name": "کاربر", "username": username},
         "chat": {"id": chat_id, "type": "private"},
     }
     if text is not None:
@@ -63,14 +70,75 @@ class BotTests(unittest.TestCase):
     def run_async(self, coro):
         return asyncio.run(coro)
 
-    def test_start_displays_persistent_single_button(self):
+    def test_start_logs_real_ids_without_message_content(self):
+        with self.assertLogs("bot", level="INFO") as captured:
+            self.run_async(
+                self.bot.handle_update(
+                    private_message(23, 1, "/start never-log-this-body", chat_id=456789)
+                )
+            )
+        joined = "\n".join(captured.output)
+        self.assertIn("OWNER_DISCOVERY | chat_id=456789 | user_id=23 | username=sample", joined)
+        self.assertNotIn("never-log-this-body", joined)
+        self.assertNotIn("آزمایشی", joined)
+
+    def test_discovery_log_is_emitted_for_non_private_messages_too(self):
+        update = {
+            "update_id": 99,
+            "message": {
+                "message_id": 70,
+                "from": {"id": 37, "username": "group_user"},
+                "chat": {"id": -7654, "type": "group"},
+                "text": "private-content-must-not-be-logged",
+            },
+        }
+        with self.assertLogs("bot", level="INFO") as captured:
+            self.run_async(self.bot.handle_update(update))
+        self.assertIn("chat_id=-7654 | user_id=37 | username=group_user", captured.output[0])
+        self.assertNotIn("private-content-must-not-be-logged", captured.output[0])
+        self.assertEqual(self.api.sent, [])
+
+    def test_start_displays_blue_persistent_reply_keyboard(self):
         self.run_async(self.bot.handle_update(private_message(23, 1, "/start")))
         chat, text, kwargs, _ = self.api.sent[-1]
         self.assertEqual(chat, 23)
         self.assertIn("خوش آمدید", text)
         markup = kwargs["reply_markup"]
-        self.assertEqual(markup["keyboard"], [[{"text": BUTTON_TEXT}]])
+        self.assertEqual(
+            [[button["text"] for button in row] for row in markup["keyboard"]],
+            [[START_BUTTON], [BUTTON_TEXT], [HELP_BUTTON]],
+        )
+        self.assertTrue(all(button["style"] == "primary" for row in markup["keyboard"] for button in row))
+        self.assertTrue(markup["resize_keyboard"])
         self.assertFalse(markup["one_time_keyboard"])
+        self.assertNotIn("remove_keyboard", markup)
+
+    def test_start_and_help_buttons_work_and_keep_keyboard_attached(self):
+        async def sequence():
+            await self.bot.handle_update(private_message(23, 1, "/start"))
+            await self.bot.handle_update(private_message(23, 2, HELP_BUTTON))
+            await self.bot.handle_update(private_message(23, 3, START_BUTTON))
+            await self.bot.handle_update(private_message(23, 4, BUTTON_TEXT))
+        self.run_async(sequence())
+        help_reply = self.api.sent[1]
+        start_reply = self.api.sent[2]
+        prompt = self.api.sent[3]
+        self.assertIn("راهنمای استفاده", help_reply[1])
+        self.assertIn("خوش آمدید", start_reply[1])
+        for sent in (self.api.sent[0], help_reply, start_reply, prompt):
+            self.assertEqual(sent[2]["reply_markup"], MAIN_MENU_MARKUP)
+            self.assertFalse(sent[2]["reply_markup"]["one_time_keyboard"])
+
+    def test_unconfigured_owner_start_shows_chat_id_setup_guide_and_menu(self):
+        bot = AnonymousBot(self.api, self.storage, owner_id=None)
+        with self.assertLogs("bot", level="INFO") as captured:
+            self.run_async(bot.handle_update(private_message(23, 1, "/start", chat_id=456789)))
+        message = self.api.sent[-1]
+        self.assertIn("OWNER_ID", message[1])
+        self.assertIn("chat_id", message[1])
+        self.assertIn("هیچ کاربری را خودکار مالک نمی‌کند", message[1])
+        self.assertIn("456789", captured.output[0])
+        self.assertEqual(message[2]["reply_markup"], MAIN_MENU_MARKUP)
 
     def test_button_then_user_text_reaches_owner_with_private_metadata(self):
         self.run_async(self.bot.handle_update(private_message(23, 1, BUTTON_TEXT)))
@@ -84,12 +152,13 @@ class BotTests(unittest.TestCase):
         self.assertNotIn("شناسه کاربر: 23", " ".join(item[1] for item in self.api.sent if item[0] == 23))
         self.assertEqual(self.api.copied[0][:3], (9001, 23, 2))
         self.assertIn("با موفقیت", [item[1] for item in self.api.sent if item[0] == 23][-1])
+        user_responses = [item for item in self.api.sent if item[0] == 23]
+        self.assertTrue(all(item[2].get("reply_markup") == MAIN_MENU_MARKUP for item in user_responses))
 
     def test_reply_routes_only_to_original_sender_and_survives_restart(self):
         async def sequence():
             await self.bot.handle_update(private_message(23, 1, BUTTON_TEXT))
             await self.bot.handle_update(private_message(23, 2, "original"))
-            # Reopen SQLite as if the process restarted.
             self.storage.close()
             self.storage = Storage(self.db_path)
             self.bot = AnonymousBot(self.api, self.storage, owner_id=9001)
@@ -98,6 +167,23 @@ class BotTests(unittest.TestCase):
         self.run_async(sequence())
         self.assertEqual(self.api.copied[-1][:3], (23, 9001, 90))
         self.assertNotEqual(self.api.copied[-1][0], 24)
+
+    def test_owner_authorization_uses_numeric_id_not_username(self):
+        self.bot.owner_username = "realowner"
+        # A different numeric user cannot gain owner powers by copying the owner's username.
+        self.run_async(
+            self.bot.handle_update(
+                private_message(24, 10, "spoof", reply_to=555, username="realowner")
+            )
+        )
+        self.assertEqual(self.api.copied, [])
+        # The configured numeric owner is recognized even if their username has changed.
+        self.run_async(
+            self.bot.handle_update(
+                private_message(9001, 11, "reply", reply_to=555, username="renamed")
+            )
+        )
+        self.assertIn("معتبر", self.api.sent[-1][1])
 
     def test_owner_reply_to_unmapped_message_fails_safely(self):
         self.run_async(self.bot.handle_update(private_message(9001, 10, "reply", reply_to=55555)))
@@ -112,10 +198,11 @@ class BotTests(unittest.TestCase):
     def test_unconfigured_owner_disables_sending_without_crashing(self):
         bot = AnonymousBot(self.api, self.storage, owner_id=None)
         self.run_async(bot.handle_update(private_message(23, 1, "/start")))
-        self.assertIn("غیرفعال", self.api.sent[-1][1])
+        self.assertIn("OWNER_ID", self.api.sent[-1][1])
         self.run_async(bot.handle_update(private_message(23, 2, BUTTON_TEXT)))
-        self.assertEqual(self.api.sent[-1][1], OWNER_DISABLED)
+        self.assertIn("غیرفعال", self.api.sent[-1][1])
         self.assertEqual(self.api.copied, [])
+        self.assertEqual(self.api.sent[-1][2]["reply_markup"], MAIN_MENU_MARKUP)
 
     def test_copy_failure_notifies_and_stores_mapped_fallback(self):
         self.api.fail_copy = True
@@ -132,7 +219,7 @@ class BotTests(unittest.TestCase):
     def test_network_error_is_handled(self):
         async def sequence():
             await self.bot.handle_update(private_message(23, 1, BUTTON_TEXT))
-            self.api.fail_send = True  # Fail sending the owner's metadata once.
+            self.api.fail_send = True
             await self.bot.handle_update(private_message(23, 2, "content"))
         self.run_async(sequence())
         self.assertEqual(self.api.copied, [])
