@@ -17,6 +17,42 @@ from soroush_api import SoroushAPI, SoroushAPIError
 START_BUTTON = "🚀 استارت"
 BUTTON_TEXT = "✉️ پیام ناشناس به مالک"
 HELP_BUTTON = "📖 راهنمای استفاده"
+
+# Owner moderation commands. They accept the target as "@username" or a numeric chat id.
+BLOCK_COMMAND = "مسدود"
+UNBLOCK_COMMAND = "رفع‌مسدود"
+BLOCKLIST_COMMAND = "لیست‌مسدود"
+BLOCK_COMMAND_ALIASES = {
+    BLOCK_COMMAND, "مسدودکن", "بلاک", "بلاککن", "block", "ban",
+}
+UNBLOCK_COMMAND_ALIASES = {
+    UNBLOCK_COMMAND, "رفع", "رفعمسدودیت", "آنبلاک", "آنمسدود", "آزادکن", "unblock", "unban",
+}
+BLOCKLIST_COMMAND_ALIASES = {
+    BLOCKLIST_COMMAND, "لیستمسدودها", "مسدودها", "بلاکلیست", "blocklist",
+}
+BLOCK_USAGE = (
+    "🚫 برای مسدود کردن کاربر، دستور را با یوزرنیم یا چت‌ایدی بفرستید:\n"
+    "مسدود @username\n"
+    "مسدود 123456789\n"
+    "همچنین می‌توانید روی پیام همان کاربر ریپلای کنید و فقط بنویسید: مسدود"
+)
+UNBLOCK_USAGE = (
+    "♻️ برای رفع مسدودیت:\n"
+    "رفع‌مسدود @username\n"
+    "رفع‌مسدود 123456789"
+)
+BLOCKED_USER_NOTICE = (
+    "⛔️ امکان ارسال پیام ناشناس برای شما در حال حاضر وجود ندارد."
+)
+OWNER_COMMANDS_HELP = (
+    "\n\n🛡 دستورهای مدیریتی مالک:\n"
+    "• مسدود @username — مسدود کردن با یوزرنیم\n"
+    "• مسدود 123456789 — مسدود کردن با چت‌ایدی عددی\n"
+    "• «مسدود» به‌تنهایی در Reply روی پیام کاربر\n"
+    "• رفع‌مسدود @username یا رفع‌مسدود 123456789\n"
+    "• لیست‌مسدود — نمایش فهرست مسدودها"
+)
 WELCOME = (
     "سلام! به صندوق پیام ناشناس خوش آمدید.\n"
     "از منوی پایین، ارسال پیام یا راهنمای استفاده را انتخاب کنید."
@@ -95,6 +131,73 @@ def _log_owner_discovery(chat_id: int | None, user_id: int | None, username: Any
     )
 
 
+def _normalize_command_token(text: str) -> str:
+    """Normalize a command word: drop ZWNJ/RTL marks, slashes, and case differences."""
+    cleaned = re.sub(r"[\u200c\u200d\u200e\u200f\ufeff]", "", text).strip().lower()
+    return cleaned.lstrip("/")
+
+
+_USERNAME_RE = re.compile(r"^[\w.]{2,64}$", re.UNICODE)
+_ID_TEXT_RE = re.compile(r"^[+-]?\d{1,20}$")
+
+
+def normalize_username(value: Any) -> str | None:
+    """Return a bare, validated username (no '@') or None."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip().lstrip("@").strip()
+    if not name or not _USERNAME_RE.fullmatch(name):
+        return None
+    return name.lower()
+
+
+def _parse_block_target(raw: str) -> tuple[str, Any]:
+    """Parse the argument of a block/unblock command.
+
+    Returns one of:
+      ("username", "<name>")  for "@name" or "name"
+      ("id", <int>)           for a numeric chat id
+      ("invalid", None)       for something unusable (e.g. a group id)
+      ("empty", None)         when no argument was given
+    """
+    arg = raw.strip().strip(":،,").strip()
+    if not arg:
+        return "empty", None
+    if arg.startswith("@"):
+        name = normalize_username(arg)
+        return ("username", name) if name else ("invalid", None)
+    if _ID_TEXT_RE.fullmatch(arg):
+        number = int(arg)
+        # Private user chat ids are positive; negative ids mean groups/channels.
+        return ("id", number) if number > 0 else ("invalid", None)
+    name = normalize_username(arg)
+    return ("username", name) if name else ("invalid", None)
+
+
+def _fold_alias(value: str) -> str:
+    """Fold a command word so ZWNJ, spaces, underscores, slashes and case do not matter."""
+    return re.sub(r"[\u200c\u200d\u200e\u200f\ufeff\s_/]+", "", value).lower()
+
+
+_BLOCK_ALIAS_FOLDED = {_fold_alias(alias) for alias in BLOCK_COMMAND_ALIASES}
+_UNBLOCK_ALIAS_FOLDED = {_fold_alias(alias) for alias in UNBLOCK_COMMAND_ALIASES}
+_BLOCKLIST_ALIAS_FOLDED = {_fold_alias(alias) for alias in BLOCKLIST_COMMAND_ALIASES}
+
+
+def _block_command_kind(command: str) -> str | None:
+    """Map a command token to 'block' | 'unblock' | 'blocklist'."""
+    folded = _fold_alias(command)
+    if not folded:
+        return None
+    if folded in _BLOCK_ALIAS_FOLDED:
+        return "block"
+    if folded in _UNBLOCK_ALIAS_FOLDED:
+        return "unblock"
+    if folded in _BLOCKLIST_ALIAS_FOLDED:
+        return "blocklist"
+    return None
+
+
 def _display_name(user: dict[str, Any]) -> str:
     name = " ".join(
         str(user.get(key, "")).strip()
@@ -166,20 +269,45 @@ class AnonymousBot:
         command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
         is_owner = self._is_owner(user_id, chat_id)
 
+        # Remember the username so a later "مسدود @name" (or remeasure after a rename)
+        # can still be matched to a numeric ID even if the user changes it.
+        sender_username = normalize_username(sender.get("username"))
+        if sender_username:
+            self.storage.upsert_known_user(user_id, chat_id, sender_username)
+
         # A real owner reply takes precedence over menu labels that might be the reply text.
         if is_owner and isinstance(message.get("reply_to_message"), dict):
+            if self.storage.get_awaiting_chat(user_id) is None:
+                handled = await self._handle_owner_command(message, user_id, chat_id)
+                if handled:
+                    return
             await self._handle_owner_message(message)
             return
+
+        # Owner moderation commands (block / unblock / list) never apply to other users.
+        if is_owner and self.storage.get_awaiting_chat(user_id) is None:
+            if await self._handle_owner_command(message, user_id, chat_id):
+                return
 
         # Both /start and the persistent start button show the same main menu.
         if command == "/start" or text == START_BUTTON:
             welcome = WELCOME + (OWNER_SETUP_GUIDE if self.owner_id is None else "")
+            if is_owner:
+                welcome += OWNER_COMMANDS_HELP
             await self._user_say(chat_id, welcome)
             return
 
         if text == HELP_BUTTON:
             help_text = HELP_TEXT + (OWNER_SETUP_GUIDE if self.owner_id is None else "")
             await self._user_say(chat_id, help_text)
+            return
+
+        # Blocked users cannot start composing an anonymous message.
+        if self.storage.is_blocked(user_id, sender_username):
+            if sender_username:
+                self.storage.remember_username(user_id, sender_username, chat_id)
+            self.storage.clear_awaiting(user_id)
+            await self._user_say(chat_id, BLOCKED_USER_NOTICE)
             return
 
         # Retain the old button label for users who still have an older keyboard cached.
@@ -266,6 +394,142 @@ class AnonymousBot:
                 user_chat_id,
                 "⚠️ مشخصات پیام به مالک ارسال شد، اما خود محتوای این نوع پیام توسط API قابل کپی نبود.",
             )
+
+    # ------------------------------------------------------------------
+    # Owner moderation: block / unblock / list blocked users
+    # ------------------------------------------------------------------
+    async def _handle_owner_command(self, message: dict[str, Any], user_id: int,
+                                    chat_id: int) -> bool:
+        """Handle «مسدود …» style commands. Returns True when the message was consumed."""
+        text = message.get("text")
+        if not isinstance(text, str):
+            return False
+        parts = text.strip().split(maxsplit=1)
+        if not parts:
+            return False
+        first = parts[0]
+        argument = parts[1] if len(parts) > 1 else ""
+        kind = _block_command_kind(_normalize_command_token(first))
+        if kind is None and "@" in first:
+            # Tolerate the command glued to the username: «مسدود@osinw».
+            head, _, tail = first.partition("@")
+            kind = _block_command_kind(_normalize_command_token(head))
+            if kind is not None:
+                argument = ("@" + tail + (" " + argument if argument else "")).strip()
+        if kind is None:
+            return False
+
+        if kind == "blocklist":
+            await self._send_blocklist(chat_id)
+            return True
+        if kind == "block":
+            await self._block_target(message, chat_id, argument)
+            return True
+        await self._unblock_target(message, chat_id, argument)
+        return True
+
+    def _resolve_target(self, argument: str, message: dict[str, Any]) -> tuple[str, Any]:
+        """Work out who the command refers to: explicit argument first, then Reply target."""
+        kind, value = _parse_block_target(argument)
+        if kind != "empty":
+            return kind, value
+        reply = message.get("reply_to_message")
+        owner_chat_id = _valid_id((message.get("chat") or {}).get("id"))
+        reply_id = _valid_id(reply.get("message_id")) if isinstance(reply, dict) else None
+        if reply_id is not None and owner_chat_id is not None:
+            target = self.storage.get_reply_target(owner_chat_id, reply_id)
+            if target is not None:
+                return "id", target[0]
+        return "empty", None
+
+    async def _block_target(self, message: dict[str, Any], chat_id: int, argument: str) -> None:
+        kind, value = self._resolve_target(argument, message)
+        if kind == "empty":
+            await self._say(chat_id, "⚠️ مخاطب مشخص نشد.\n" + BLOCK_USAGE)
+            return
+        if kind == "invalid":
+            await self._say(chat_id, "⚠️ یوزرنیم یا چت‌ایدی معتبر نیست.\n" + BLOCK_USAGE)
+            return
+
+        if kind == "id":
+            target_id: int = value
+            username = None
+            row = self.storage.get_known_user(target_id)
+            if row is not None:
+                username = row.get("username")
+            if target_id == self.owner_id:
+                await self._say(chat_id, "⚠️ نمی‌توانید خودتان را مسدود کنید.")
+                return
+        else:
+            username = value
+            known = self.storage.find_user_id_by_username(username)
+            target_id = known if known is not None else None
+            if target_id is None:
+                # Not seen yet: keep a username-only rule that matches future messages.
+                self.storage.block_username_only(username)
+                await self._say(
+                    chat_id,
+                    f"🚫 یوزرنیم @{username} مسدود شد.\n"
+                    "این کاربر هنوز با ربات صحبت نکرده است؛ به‌محض ارسال پیام بعدی‌اش، "
+                    "پیام‌هایش برای شما ارسال نخواهد شد. برای مسدودسازی قطعی، چت‌ایدی عددی را هم مسدود کنید.",
+                )
+                return
+            if target_id == self.owner_id:
+                await self._say(chat_id, "⚠️ نمی‌توانید خودتان را مسدود کنید.")
+                return
+            row = self.storage.get_known_user(target_id)
+            username = row.get("username") if row else username
+
+        known_row = self.storage.get_known_user(target_id)
+        known_chat_id = known_row.get("chat_id") if known_row else None
+        self.storage.block_user(target_id, known_chat_id, username)
+        self.storage.clear_awaiting(target_id)
+        label = f"@{username}" if username else "بدون یوزرنیم"
+        await self._say(
+            chat_id,
+            "✅ کاربر مسدود شد.\n"
+            f"🆔 شناسه: {target_id}\n"
+            f"🔗 یوزرنیم: {label}\n"
+            "از این پس پیام‌های او برای شما ارسال نمی‌شود.",
+        )
+
+    async def _unblock_target(self, message: dict[str, Any], chat_id: int, argument: str) -> None:
+        kind, value = self._resolve_target(argument, message)
+        if kind == "empty":
+            await self._say(chat_id, "⚠️ مخاطب مشخص نشد.\n" + UNBLOCK_USAGE)
+            return
+        if kind == "invalid":
+            await self._say(chat_id, "⚠️ یوزرنیم یا چت‌ایدی معتبر نیست.\n" + UNBLOCK_USAGE)
+            return
+
+        removed = False
+        if kind == "id":
+            removed = self.storage.unblock_user(value)
+        else:
+            found = self.storage.find_blocked_by_username(value)
+            if found is not None and found[0] is not None:
+                removed = self.storage.unblock_user(found[0])
+            removed = self.storage.unblock_username(value) or removed
+
+        if removed:
+            await self._say(chat_id, "♻️ مسدودیت برداشته شد؛ این کاربر دوباره می‌تواند پیام ناشناس بفرستد.")
+        else:
+            await self._say(chat_id, "ℹ️ این کاربر در فهرست مسدودها نبود.")
+
+    async def _send_blocklist(self, chat_id: int) -> None:
+        rows = self.storage.list_blocked()
+        if not rows:
+            await self._say(chat_id, "📋 فهرست مسدودها خالی است.")
+            return
+        lines = [f"📋 کاربران مسدود ({len(rows)} مورد):"]
+        for row in rows[:50]:
+            username = f"@{row['username']}" if row["username"] else "بدون یوزرنیم"
+            identifier = row["user_id"] if row["user_id"] is not None else "شناسه ناشناخته"
+            lines.append(f"• {identifier} — {username}")
+        if len(rows) > 50:
+            lines.append(f"… و {len(rows) - 50} مورد دیگر")
+        lines.append("\nبرای رفع مسدودیت: رفع‌مسدود <یوزرنیم یا چت‌ایدی>")
+        await self._say(chat_id, "\n".join(lines))
 
     async def _handle_owner_message(self, message: dict[str, Any]) -> None:
         reply = message.get("reply_to_message")
